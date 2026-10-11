@@ -125,15 +125,6 @@ Changing MachineGuid alone may be sufficient if the server weights it as the pri
 | `HaulMP.LaunchCore.dll` | no | no | File SHA-256 only | VirtualAllocEx + CreateRemoteThread |
 | `haulmp_stub.dll` | RegGetValueW (MachineGuid) | yes (auth exchange) | DeviceIoControl (disk serial) | no |
 
----
-
-## Scope and Limitations
-
-Based on static analysis of client binaries. Specific unknowns:
-
-- Whether additional identifiers (MAC address, volume serial, CPUID) are collected inside `haulmp_stub.dll` beyond what is statically visible.
-- How the server combines or weights individual identifiers.
-- Whether the server applies a confidence threshold before escalating to a "ban evasion" response.
 
 ---
 
