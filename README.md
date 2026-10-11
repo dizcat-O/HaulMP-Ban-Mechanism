@@ -1,121 +1,142 @@
 # HaulMP Ban Mechanism
 
-Technical analysis of the ban detection and error-reporting mechanism used by the **HaulMP launcher and updater**.
+Technical analysis of the ban detection and HWID fingerprinting mechanism used by the HaulMP launcher, updater, and game stub.
 
-This repository documents the observed client-side execution flow when the server rejects an update request because the PC or Steam library is banned.
+---
 
 ## Overview
 
-When the HaulMP server rejects a request from a banned client, it returns an HTTP error response. The updater propagates this error through its exception-handling and reporting pipeline until the launcher displays the resulting message to the user.
+When HaulMP rejects a client, the ban is enforced at two levels: an HTTP-layer rejection during the update check, and a hardware fingerprint collected by a DLL injected into the game process. The hardware fingerprint persists across IP changes and Steam account changes because it is tied to the host machine, not the network identity.
 
-The observed ban response contains the following reason phrase:
+| Component | Type | Role |
+|-----------|------|------|
+| `HaulMP.exe` | .NET updater | Fetches update manifest; receives ban as HTTP reason phrase; writes JSON status file |
+| `HaulMP.Launcher.exe` | .NET launcher | Reads JSON status; raises `IOException`; displays ban message to user |
+| `HaulMP.LaunchCore.dll` | Native x64 DLL | SHA-256 verifies ETS2 exe; spawns ETS2; injects `haulmp_stub.dll` into ETS2 via `CreateRemoteThread(LoadLibraryW)` |
+| `haulmp_stub.dll` | Native x64 DLL (injected into ETS2) | Reads machine fingerprint (MachineGuid + disk serial); authenticates with HaulMP server; triggers ban-evasion rejection if fingerprint is blacklisted |
 
-> This PC or Steam library is banned from HaulMP.
+---
 
 ## Ban Detection Flow
 
-```text
+```
 HaulMP Server
      |
-     | HTTP 403 Forbidden
-     | Reason: PC or Steam library is banned
+     |  HTTP 4xx  Reason: "This PC or Steam library is banned from HaulMP."
+     |            -- OR --  "Banned: ban evasion."
      v
-<Get>d__26::MoveNext
-     |
-     | EnsureSuccessStatusCode()
-     | Throws HttpRequestException
+HaulMP.exe  -  <Get>d__26::MoveNext
+     |  EnsureSuccessStatusCode() -> throws HttpRequestException
+     |  Catch: status.Text = ex.Message
+     |  Updater::Report(done=true, error=true, message=status.Text)
      v
-<Run>d__27::MoveNext
-     |
-     | Catch exception
-     | status.Text = ex.Message
-     | Finish(failed = true)
-     v
-Updater::Report
-     |
-     | Serializes error information
-     v
-{
-  "error": true,
-  "message": "<exception message>"
-}
+%LocalAppData%\HaulMP\Client\status\<guid>.json
+     { "error": true, "message": "<reason phrase>" }
      |
      v
-HaulMP.Launcher.exe
-     |
-     | UpdateReport.Error == true
-     | Throws IOException(UpdateReport.Message)
+HaulMP.Launcher.exe  -  <RunUpdate>d__7a::MoveNext
+     |  UpdateReport.Error == true
+     |  throw new IOException(UpdateReport.Message)
      v
-Launcher UI
-     |
-     v
-Displays the ban-related error message
+Launcher UI  ->  displays ban message
 ```
+
+Two distinct rejection messages observed:
+- `"This PC or Steam library is banned from HaulMP."` - standard account ban
+- `"Banned: ban evasion."` - triggered when the server recognises a previously banned hardware fingerprint connecting under a new IP or Steam account
+
+---
 
 ## HTTP Request Analysis
 
-Based on the examined client implementation, the updater initializes its HTTP client using:
+### Updater (HaulMP.exe)
+
+The updater creates a plain HttpClient with no authentication headers and no hardware identifier in the request:
 
 ```csharp
-new HttpClient(
-    new HttpClientHandler
-    {
-        AllowAutoRedirect = false
-    }
-);
+new HttpClient(new HttpClientHandler { AllowAutoRedirect = false })
 ```
 
-The client also configures a timeout of approximately ten minutes.
+Fetches `stable.json?check=<UtcNow.Ticks>` and `stable.sig?check=<UtcNow.Ticks>`. The `check` parameter is a cache-buster. No HWID, Steam token, or session credential observed in these requests.
 
-The update URL includes a cache-busting query parameter:
+### Launcher (HaulMP.Launcher.exe)
 
-```text
-?check=<UtcNow.Ticks>
-```
+Sets one additional header: `User-Agent: HaulMP-Launcher/<version>`. No hardware identifier or Steam credential observed at this layer.
 
-### Observed request characteristics
+The ban message originates entirely on the server. The string "banned" has zero matches in any examined client binary. The server returns the rejection text as an HTTP reason phrase; the client propagates it unchanged to the UI.
 
-- **Authentication headers:** No authentication headers were observed in the examined client setup.
-- **Steam credentials:** No Steam token was observed being explicitly attached to the request.
-- **HWID:** No hardware identifier was observed being explicitly attached to the request.
-- **Query parameters:** The observed `check` parameter appears to serve as a cache-buster.
-- **Redirect handling:** Automatic HTTP redirects are disabled in the configured handler.
+---
 
-These findings describe the examined client code. They do not establish that the complete application never transmits identifying information through another component or request.
+## Hardware Fingerprinting
 
-## How the Ban Is Identified
+### Injection chain
 
-The client-side implementation examined here does not reveal an explicit hardware ID, Steam authentication token, or dedicated ban identifier being attached to the relevant HTTP request.
+`HaulMP.LaunchCore.dll` is a native (non-.NET) DLL loaded by the launcher via `LoadLibraryExW`. Exports two functions: `HaulMP_CheckGame` and `HaulMP_LaunchGame`.
 
-Consequently, the server may identify the client using its source IP address or information maintained server-side. However, the exact server-side identification method cannot be conclusively established from the client implementation alone.
+`HaulMP_LaunchGame` executes the following sequence:
 
-Possible mechanisms include:
+1. SHA-256 hash the ETS2 executable and compare against a hardcoded expected digest (anti-tamper). Failure throws `haulmp_launch::Failure`.
+2. Spawn ETS2 with flags `-pure -nointro` via `CreateProcessW`.
+3. Create named Win32 events for IPC: `Local\HaulMP-SkinStartup-<PID>-Ready` and `Local\HaulMP-SkinStartup-<PID>-Failed`.
+4. Inject `haulmp_stub.dll` into the ETS2 process:
+   `VirtualAllocEx` -> `WriteProcessMemory(DLL path)` -> `CreateRemoteThread(LoadLibraryW, path)`
+5. Wait up to 10 s for the ready event, then exchange authentication data (30 s timeout).
 
-- Source IP address matching.
-- Server-side records associated with previous requests.
-- Identification performed by another component not covered by the examined code.
+`HaulMP.LaunchCore.dll` import table confirms: no registry, network, or hardware enumeration APIs. All HWID collection is delegated to `haulmp_stub.dll`.
 
-**Important:** IP-based identification is a hypothesis based on the observed request, not a confirmed description of HaulMP's server implementation.
+### What haulmp_stub.dll reads
 
-## Error Propagation
+Static analysis of `haulmp_stub.dll` (6.3 MB, compiled with LLVM/libc++) confirms:
 
-The observed error-handling process consists of four stages:
+| Identifier | API | Location |
+|------------|-----|----------|
+| Windows Machine GUID | `RegOpenKeyExW`, `RegGetValueW` | `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` |
+| Physical disk serial | `DeviceIoControl` | `\\.\PhysicalDrive0` via `IOCTL_STORAGE_QUERY_PROPERTY` |
 
-1. **HTTP rejection:** The server returns an unsuccessful HTTP response.
-2. **Exception generation:** `EnsureSuccessStatusCode()` throws an `HttpRequestException`.
-3. **Updater reporting:** The exception message is assigned to the status text and serialized into a JSON report.
-4. **Launcher display:** The launcher reads the report and raises an `IOException` containing the reported message.
+`BCryptOpenAlgorithmProvider` is also present, consistent with combining these values into a fingerprint digest before transmission.
 
-This allows the server's rejection message to propagate through the updater and appear in the launcher UI.
+---
+
+## Why IP Change and New Steam Account Fail
+
+The server-side ban is keyed to the hardware fingerprint, not the network address or Steam identity. When a previously banned fingerprint reconnects under a new IP or Steam account, the server responds with the "ban evasion" reason phrase.
+
+Verified empirically: Cloudflare WARP (new IP) and a brand-new Steam account both triggered the "ban evasion" response on the same physical machine.
+
+---
+
+## Bypass Implications
+
+The fingerprint is derived from MachineGuid and physical disk serial:
+
+1. MachineGuid: changeable by writing a new GUID to `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` with administrator privileges.
+2. Disk serial: requires a kernel-level driver or registry override for virtual/software-enumerated devices.
+
+Changing MachineGuid alone may be sufficient if the server weights it as the primary identifier. Testing required.
+
+---
+
+## Component Import Summary
+
+| Component | Registry | Network | Hardware I/O | Process injection |
+|-----------|----------|---------|-------------|------------------|
+| `HaulMP.exe` | no | HttpClient (no HWID headers) | no | no |
+| `HaulMP.Launcher.exe` | no | HttpClient (User-Agent only) | no | no |
+| `HaulMP.LaunchCore.dll` | no | no | File SHA-256 only | VirtualAllocEx + CreateRemoteThread |
+| `haulmp_stub.dll` | RegGetValueW (MachineGuid) | yes (auth exchange) | DeviceIoControl (disk serial) | no |
+
+---
 
 ## Scope and Limitations
 
-This repository documents the observed client-side behavior and the conclusions that can reasonably be drawn from it.
+Based on static analysis of client binaries. Specific unknowns:
 
-It does not include a verified analysis of the server's internal ban database, IP matching rules, Steam library validation, or other server-side enforcement logic.
+- Whether additional identifiers (MAC address, volume serial, CPUID) are collected inside `haulmp_stub.dll` beyond what is statically visible.
+- How the server combines or weights individual identifiers.
+- Whether the server applies a confidence threshold before escalating to a "ban evasion" response.
 
-All conclusions should be interpreted in the context of the examined client implementation.
+---
 
 ## Disclaimer
 
-This repository is intended for software analysis, documentation, and educational reverse engineering. It does not claim access to HaulMP's internal server implementation or private infrastructure.
+Intended for software analysis, documentation, and educational reverse engineering. Does not claim access to HaulMP's internal server implementation or private infrastructure.
