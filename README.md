@@ -95,24 +95,6 @@ Static analysis of `haulmp_stub.dll` (6.3 MB, compiled with LLVM/libc++) confirm
 
 `BCryptOpenAlgorithmProvider` is also present, consistent with combining these values into a fingerprint digest before transmission.
 
----
-
-## Why IP Change and New Steam Account Fail
-
-The server-side ban is keyed to the hardware fingerprint, not the network address or Steam identity. When a previously banned fingerprint reconnects under a new IP or Steam account, the server responds with the "ban evasion" reason phrase.
-
-Verified empirically: Cloudflare WARP (new IP) and a brand-new Steam account both triggered the "ban evasion" response on the same physical machine.
-
----
-
-## Bypass Implications
-
-The fingerprint is derived from MachineGuid and physical disk serial:
-
-1. MachineGuid: changeable by writing a new GUID to `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` with administrator privileges.
-2. Disk serial: requires a kernel-level driver or registry override for virtual/software-enumerated devices.
-
-Changing MachineGuid alone may be sufficient if the server weights it as the primary identifier. Testing required.
 
 ---
 
